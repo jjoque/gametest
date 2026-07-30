@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Logistics Wars v0.016</title>
+    <title>Logistics Wars v0.019</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
 
@@ -91,7 +91,7 @@
 </head>
 <body>
 
-    <h1>LOGISTICS WARS v0.016</h1>
+    <h1>LOGISTICS WARS v0.019</h1>
     
     <div id="game-container">
         <canvas id="gameCanvas" width="1000" height="700" oncontextmenu="return false;"></canvas>
@@ -113,9 +113,8 @@
 
     <div class="instructions">
         LEFT CLICK / DRAG to select units (Soldiers, Medics, Artillery). RIGHT CLICK to move.<br>
-        Units smoothly slide around terrain obstacles.<br>
-        Passive supply drain is increased—keep Trucks active to maintain your frontline!<br>
-        Watch out: Computer AI locks down key mountain & river choke points with Artillery!
+        Automated Truck Logistics: 1 Truck load ( cyan bar ) resupplies 4 Soldiers, 1 Medic, or 0.5 Artillery.<br>
+        v0.019 Update: Added Visibility-Graph Pathfinding & Smart Field Re-tasking for trucks!
     </div>
 
     <script>
@@ -147,16 +146,13 @@
         const SOLDIER_SPEED = 1.2;
         const ARTILLERY_SPEED = 0.6;
         const MEDIC_SPEED = 1.4;
-        const TRUCK_SPEED = 2.0;
-        const MAX_SUPPLY = 100;
+        const TRUCK_SPEED = 1.0; 
         
         // Range Configuration
         const SOLDIER_FIRING_RANGE = 160; 
         const ARTILLERY_MAX_RANGE = 350;
         const ARTILLERY_MIN_RANGE = 150; 
         const MEDIC_HEAL_RANGE = 120;
-        
-        const COLLISION_RADIUS = 20; 
 
         // Strategic Choke Points
         const CHOKE_POINTS = [
@@ -168,6 +164,22 @@
         const terrainFeatures = [
             { type: 'mountain', x: 250, y: 0, w: 100, h: 450 },  
             { type: 'river',    x: 550, y: 250, w: 100, h: 450 } 
+        ];
+
+        // Visibility Graph Nodes around obstacles
+        const NAV_WAYPOINTS = [
+            { id: 0, x: 180, y: 550 }, // W0: West Mountain Gap
+            { id: 1, x: 420, y: 550 }, // W1: East Mountain Gap
+            { id: 2, x: 480, y: 150 }, // W2: West River Gap
+            { id: 3, x: 720, y: 150 }  // W3: East River Gap
+        ];
+
+        // Topology Adjacency List for Waypoints
+        const WAYPOINT_GRAPH = [
+            [1],       // W0 connects to W1
+            [0, 2],    // W1 connects to W0 & W2
+            [1, 3],    // W2 connects to W1 & W3
+            [2]        // W3 connects to W2
         ];
 
         function checkTerrainCollision(x, y, radius) {
@@ -192,50 +204,175 @@
             return false;
         }
 
-        // Smooth Navigation & Wall Sliding
+        // Raycasting check to see if a straight path hits terrain
+        function checkLineCollision(x1, y1, x2, y2) {
+            let steps = 30;
+            for (let i = 0; i <= steps; i++) {
+                let px = x1 + (x2 - x1) * (i / steps);
+                let py = y1 + (y2 - y1) * (i / steps);
+                if (checkTerrainCollision(px, py, 14)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // v0.019 Visibility Graph Pathfinding Engine
+        function getNextPathWaypoint(startX, startY, destX, destY) {
+            // 1. Direct path check
+            if (!checkLineCollision(startX, startY, destX, destY)) {
+                return { x: destX, y: destY };
+            }
+
+            // 2. Find all waypoints directly visible from start
+            let startVisible = [];
+            for (let i = 0; i < NAV_WAYPOINTS.length; i++) {
+                let wp = NAV_WAYPOINTS[i];
+                if (!checkLineCollision(startX, startY, wp.x, wp.y)) {
+                    startVisible.push(i);
+                }
+            }
+
+            // 3. Find all waypoints directly visible from destination
+            let destVisible = [];
+            for (let i = 0; i < NAV_WAYPOINTS.length; i++) {
+                let wp = NAV_WAYPOINTS[i];
+                if (!checkLineCollision(wp.x, wp.y, destX, destY)) {
+                    destVisible.push(i);
+                }
+            }
+
+            // Fallback if direct visibility blocked
+            if (startVisible.length === 0 || destVisible.length === 0) {
+                let bestWp = null;
+                let minDist = Infinity;
+                for (let wp of NAV_WAYPOINTS) {
+                    if (!checkLineCollision(startX, startY, wp.x, wp.y)) {
+                        let d = Math.hypot(wp.x - startX, wp.y - startY) + Math.hypot(destX - wp.x, destY - wp.y);
+                        if (d < minDist) {
+                            minDist = d;
+                            bestWp = wp;
+                        }
+                    }
+                }
+                return bestWp || { x: destX, y: destY };
+            }
+
+            // 4. Breadth-First Path Search across topological graph
+            let bestNextWpIdx = -1;
+            let minTotalDist = Infinity;
+
+            for (let sIdx of startVisible) {
+                let queue = [[sIdx]];
+                let visited = new Set([sIdx]);
+                let shortestPathToDest = null;
+
+                while (queue.length > 0) {
+                    let path = queue.shift();
+                    let curr = path[path.length - 1];
+
+                    if (destVisible.includes(curr)) {
+                        shortestPathToDest = path;
+                        break;
+                    }
+
+                    for (let neighbor of WAYPOINT_GRAPH[curr]) {
+                        if (!visited.has(neighbor)) {
+                            visited.add(neighbor);
+                            queue.push([...path, neighbor]);
+                        }
+                    }
+                }
+
+                if (shortestPathToDest) {
+                    let dist = Math.hypot(NAV_WAYPOINTS[sIdx].x - startX, NAV_WAYPOINTS[sIdx].y - startY);
+                    for (let k = 0; k < shortestPathToDest.length - 1; k++) {
+                        let a = NAV_WAYPOINTS[shortestPathToDest[k]];
+                        let b = NAV_WAYPOINTS[shortestPathToDest[k+1]];
+                        dist += Math.hypot(b.x - a.x, b.y - a.y);
+                    }
+                    let lastWp = NAV_WAYPOINTS[shortestPathToDest[shortestPathToDest.length - 1]];
+                    dist += Math.hypot(destX - lastWp.x, destY - lastWp.y);
+
+                    if (dist < minTotalDist) {
+                        minTotalDist = dist;
+                        bestNextWpIdx = sIdx;
+                    }
+                }
+            }
+
+            if (bestNextWpIdx !== -1) {
+                let targetWp = NAV_WAYPOINTS[bestNextWpIdx];
+                // Step to next node if unit is already at the target waypoint
+                if (Math.hypot(targetWp.x - startX, targetWp.y - startY) < 18) {
+                    return getNextPathWaypoint(targetWp.x + (destX > targetWp.x ? 5 : -5), targetWp.y, destX, destY);
+                }
+                return targetWp;
+            }
+
+            return { x: destX, y: destY };
+        }
+
+        // Automatic Tangent Routing & Navigation around Obstacles
         function attemptSmoothMove(unit, moveX, moveY) {
+            let speed = Math.hypot(moveX, moveY);
+            if (speed === 0) return true;
+
+            let radius = unit.size / 2 + 1;
             let nextX = unit.x + moveX;
             let nextY = unit.y + moveY;
-            let radius = unit.size / 2;
 
-            // Direct move check
+            // Direct route clear check
             if (!checkTerrainCollision(nextX, nextY, radius)) {
                 unit.x = nextX;
                 unit.y = nextY;
                 return true;
             }
 
-            // Slide along X axis
+            // Route search around obstacle edges at full speed
+            let targetAngle = Math.atan2(moveY, moveX);
+            let destX = unit.targetX !== null ? unit.targetX : nextX;
+            let destY = unit.targetY !== null ? unit.targetY : nextY;
+
+            let bestAngle = null;
+            let bestDist = Infinity;
+
+            for (let step = 1; step <= 12; step++) {
+                let delta = (step * 10) * (Math.PI / 180);
+                for (let dir of [1, -1]) {
+                    let testAngle = targetAngle + (delta * dir);
+                    let testX = unit.x + Math.cos(testAngle) * speed;
+                    let testY = unit.y + Math.sin(testAngle) * speed;
+
+                    if (!checkTerrainCollision(testX, testY, radius)) {
+                        let distToDest = Math.hypot(destX - testX, destY - testY);
+                        if (distToDest < bestDist) {
+                            bestDist = distToDest;
+                            bestAngle = testAngle;
+                        }
+                    }
+                }
+                if (bestAngle !== null) break;
+            }
+
+            if (bestAngle !== null) {
+                unit.x += Math.cos(bestAngle) * speed;
+                unit.y += Math.sin(bestAngle) * speed;
+                unit.heading = bestAngle;
+                return true;
+            }
+
+            // Axis-aligned wall sliding fallback
             if (!checkTerrainCollision(nextX, unit.y, radius)) {
                 unit.x = nextX;
                 return true;
             }
-
-            // Slide along Y axis
             if (!checkTerrainCollision(unit.x, nextY, radius)) {
                 unit.y = nextY;
                 return true;
             }
 
-            // Probe arc angles to smoothly navigate sharp corners
-            let currentAngle = Math.atan2(moveY, moveX);
-            let speed = Math.hypot(moveX, moveY);
-
-            for (let angleOffset = 0.3; angleOffset <= 1.2; angleOffset += 0.3) {
-                for (let dir of [-1, 1]) {
-                    let probeAngle = currentAngle + (angleOffset * dir);
-                    let probeX = unit.x + Math.cos(probeAngle) * speed;
-                    let probeY = unit.y + Math.sin(probeAngle) * speed;
-
-                    if (!checkTerrainCollision(probeX, probeY, radius)) {
-                        unit.x = probeX;
-                        unit.y = probeY;
-                        return true;
-                    }
-                }
-            }
-
-            return false; // Completely blocked
+            return false;
         }
 
         class Base {
@@ -248,12 +385,24 @@
                 this.maxHp = BASE_HP;
             }
             draw() {
-                ctx.fillStyle = this.team === 'player' ? '#2196F3' : '#F44336';
+                ctx.fillStyle = 'rgba(0,0,0,0.35)';
+                ctx.fillRect(this.x - this.size/2 + 5, this.y - this.size/2 + 5, this.size, this.size);
+
+                ctx.fillStyle = this.team === 'player' ? '#1976D2' : '#D32F2F';
                 ctx.fillRect(this.x - this.size/2, this.y - this.size/2, this.size, this.size);
                 
-                ctx.fillStyle = 'rgba(0,0,0,0.3)';
-                ctx.fillRect(this.x - 20, this.y - 20, 40, 40);
-                
+                // Base inner structure detail
+                ctx.fillStyle = this.team === 'player' ? '#64B5F6' : '#E57373';
+                ctx.fillRect(this.x - 22, this.y - 22, 44, 44);
+                ctx.fillStyle = '#111';
+                ctx.fillRect(this.x - 12, this.y - 12, 24, 24);
+
+                // Command flag indicator
+                ctx.fillStyle = '#FFD700';
+                ctx.fillRect(this.x - 2, this.y - 30, 4, 18);
+                ctx.fillRect(this.x + 2, this.y - 30, 12, 8);
+
+                // Healthbar
                 ctx.fillStyle = '#b71c1c';
                 ctx.fillRect(this.x - this.size/2, this.y - this.size/2 - 20, this.size, 6);
                 ctx.fillStyle = '#4CAF50';
@@ -269,14 +418,17 @@
                 this.y = y;
                 this.targetX = null;
                 this.targetY = null;
+                this.heading = team === 'player' ? 0 : Math.PI;
                 this.waypoints = []; 
                 
                 this.hp = type === 'soldier' ? SOLDIER_HP : (type === 'artillery' ? ARTILLERY_HP : (type === 'medic' ? MEDIC_HP : 20));
                 this.maxHp = this.hp;
-                this.size = type === 'soldier' ? 18 : (type === 'artillery' ? 24 : (type === 'medic' ? 18 : 22)); 
+                this.size = type === 'soldier' ? 18 : (type === 'artillery' ? 26 : (type === 'medic' ? 18 : 22)); 
                 this.role = 'attacker'; 
                 
-                this.supply = MAX_SUPPLY;
+                // Supply scaling: 1 truck load (100 capacity) = 4 soldiers (25 ea), 1 medic (100 ea), 0.5 artillery (200 total)
+                this.maxSupply = type === 'soldier' ? 25 : (type === 'artillery' ? 200 : (type === 'medic' ? 100 : 100));
+                this.supply = this.maxSupply;
                 this.attackCooldown = 0;
                 
                 this.truckState = 'IDLE'; 
@@ -286,9 +438,9 @@
             update() {
                 if (this.hp <= 0) return;
 
-                // --- INCREASED PASSIVE SUPPLY DRAIN (Idle / Moving) ---
+                // Passive Supply Drain
                 if (this.type !== 'truck') {
-                    this.supply -= 0.015; // Increased from 0.005
+                    this.supply -= 0.005;
                     if (this.supply < 0) this.supply = 0;
                 }
 
@@ -306,7 +458,10 @@
                     let dist = Math.hypot(this.targetX - this.x, this.targetY - this.y);
                     if (dist > 2) {
                         let speed = this.type === 'artillery' ? ARTILLERY_SPEED : (this.type === 'medic' ? MEDIC_SPEED : SOLDIER_SPEED);
-                        let angle = Math.atan2(this.targetY - this.y, this.targetX - this.x);
+                        let nextWp = getNextPathWaypoint(this.x, this.y, this.targetX, this.targetY);
+                        
+                        let angle = Math.atan2(nextWp.y - this.y, nextWp.x - this.x);
+                        this.heading = angle;
                         let moveX = Math.cos(angle) * speed;
                         let moveY = Math.sin(angle) * speed;
                         
@@ -324,7 +479,7 @@
                     }
                 }
 
-                // --- MEDIC HEALING LOGIC ---
+                // Medic Healing
                 if (this.type === 'medic' && this.supply > 0) {
                     let healTarget = null;
                     let lowestHpRatio = 1.0;
@@ -346,7 +501,6 @@
                         healTarget.hp = Math.min(healTarget.maxHp, healTarget.hp + 0.35); 
                         this.supply -= 0.18; 
 
-                        // Draw healing ray
                         ctx.beginPath();
                         ctx.moveTo(this.x, this.y);
                         ctx.lineTo(healTarget.x, healTarget.y);
@@ -357,7 +511,7 @@
                     }
                 }
 
-                // --- COMBAT UNITS (Soldier & Artillery) LOGIC ---
+                // Combat Units
                 if (this.type === 'soldier' || this.type === 'artillery') {
                     if (this.attackCooldown > 0) this.attackCooldown--;
                     else {
@@ -368,14 +522,12 @@
                         let maxRange = this.type === 'artillery' ? ARTILLERY_MAX_RANGE : SOLDIER_FIRING_RANGE;
                         let minRange = this.type === 'artillery' ? ARTILLERY_MIN_RANGE : 0;
 
-                        // Check base
                         let distToBase = Math.hypot(enemyBase.x - this.x, enemyBase.y - this.y);
                         if (distToBase < maxRange + enemyBase.size/2 && distToBase >= minRange) {
                             target = enemyBase;
                             minDist = distToBase;
                         }
 
-                        // Check enemy units
                         units.forEach(u => {
                             if (u.team !== this.team && u.hp > 0) {
                                 let d = Math.hypot(u.x - this.x, u.y - this.y);
@@ -386,8 +538,8 @@
                             }
                         });
 
-                        // Fire
                         if (target) {
+                            this.heading = Math.atan2(target.y - this.y, target.x - this.x);
                             if (this.type === 'artillery') {
                                 let baseDmg = this.supply > 0 ? 15 : 2; 
                                 this.supply -= 6.0; 
@@ -417,7 +569,7 @@
 
                             } else {
                                 let dmg = this.supply > 0 ? 5 : 1; 
-                                this.supply -= 0.5; 
+                                this.supply -= 0.25; 
                                 if (this.supply < 0) this.supply = 0;
 
                                 let defMultiplier = target.supply > 0 ? 0.5 : 1.0; 
@@ -429,45 +581,100 @@
                                 ctx.beginPath();
                                 ctx.moveTo(this.x, this.y);
                                 ctx.lineTo(target.x, target.y);
-                                ctx.strokeStyle = '#fff';
+                                ctx.strokeStyle = '#FFF59D';
+                                ctx.lineWidth = 1.5;
                                 ctx.stroke();
+                                ctx.lineWidth = 1;
                             }
                         }
                     }
                 }
 
-                // --- TRUCK LOGIC ---
+                // Truck Logistics Logic (v0.019 Logistics Engine & Bugfixes)
                 if (this.type === 'truck') {
+                    let myBase = bases.find(b => b.team === this.team);
                     let moveTarget = null;
 
+                    // 1. Refill supply if near base
+                    let distToBase = Math.hypot(myBase.x - this.x, myBase.y - this.y);
+                    if (distToBase < myBase.size/2 + 25) {
+                        this.supply = this.maxSupply;
+                    }
+
+                    // 2. Force empty trucks back to base to prevent 0-supply delivery loops
+                    if (this.supply <= 0) {
+                        this.truckTarget = null;
+                        this.truckState = 'RETURNING';
+                    }
+
                     if (this.truckState === 'IDLE') {
-                        let needyUnits = units.filter(u => u.team === this.team && u.type !== 'truck' && u.supply < 60 && u.hp > 0);
-                        
-                        if (needyUnits.length > 0) {
-                            needyUnits.sort((a, b) => a.supply - b.supply);
-                            this.truckTarget = needyUnits[0];
-                            this.truckState = 'DELIVERING';
+                        if (this.supply > 0) {
+                            let candidates = units.filter(u => u.team === this.team && u.type !== 'truck' && u.hp > 0 && u.supply < u.maxSupply);
+                            let bestTarget = null;
+                            let lowestSupplyRatio = 1.0;
+
+                            for (let u of candidates) {
+                                let incomingTrucks = units.filter(t => 
+                                    t.team === this.team && 
+                                    t.type === 'truck' && 
+                                    t !== this && 
+                                    t.truckState === 'DELIVERING' && 
+                                    t.truckTarget === u
+                                ).length;
+
+                                let needed = u.maxSupply - u.supply;
+                                let maxAllowedTrucks = (u.type === 'artillery' && needed > 100) ? 2 : 1;
+
+                                if (incomingTrucks < maxAllowedTrucks) {
+                                    let ratio = u.supply / u.maxSupply;
+                                    if (ratio < lowestSupplyRatio) {
+                                        lowestSupplyRatio = ratio;
+                                        bestTarget = u;
+                                    }
+                                }
+                            }
+
+                            if (bestTarget) {
+                                this.truckTarget = bestTarget;
+                                this.truckState = 'DELIVERING';
+                            } else if (distToBase > myBase.size/2 + 30) {
+                                // Return to base if no targets need supply
+                                this.truckState = 'RETURNING';
+                            }
                         }
                     } 
-                    else if (this.truckState === 'DELIVERING') {
-                        if (this.truckTarget && this.truckTarget.hp > 0) {
+
+                    if (this.truckState === 'DELIVERING') {
+                        if (this.truckTarget && this.truckTarget.hp > 0 && this.truckTarget.supply < this.truckTarget.maxSupply) {
                             let dist = Math.hypot(this.truckTarget.x - this.x, this.truckTarget.y - this.y);
-                            if (dist < 25) {
-                                this.truckTarget.supply = MAX_SUPPLY;
-                                this.truckTarget = null;
-                                this.truckState = 'RETURNING';
+                            if (dist < 28) {
+                                // Transfer supply
+                                let needed = this.truckTarget.maxSupply - this.truckTarget.supply;
+                                let transfer = Math.min(this.supply, needed);
+                                this.truckTarget.supply = Math.min(this.truckTarget.maxSupply, this.truckTarget.supply + transfer);
+                                this.supply -= transfer;
+
+                                if (this.supply <= 0) {
+                                    this.truckTarget = null;
+                                    this.truckState = 'RETURNING';
+                                } else if (this.truckTarget.supply >= this.truckTarget.maxSupply) {
+                                    // Target full! Re-task in the field if cargo remains
+                                    this.truckTarget = null;
+                                    this.truckState = 'IDLE'; 
+                                }
                             } else {
                                 moveTarget = { x: this.truckTarget.x, y: this.truckTarget.y };
                             }
                         } else {
+                            // Target died or filled by another truck: re-evaluate field targets
                             this.truckTarget = null;
-                            this.truckState = 'RETURNING';
+                            this.truckState = (this.supply > 0) ? 'IDLE' : 'RETURNING';
                         }
                     } 
-                    else if (this.truckState === 'RETURNING') {
-                        let myBase = bases.find(b => b.team === this.team);
-                        let dist = Math.hypot(myBase.x - this.x, myBase.y - this.y);
-                        if (dist < myBase.size/2 + 15) {
+
+                    if (this.truckState === 'RETURNING') {
+                        if (distToBase < myBase.size/2 + 20) {
+                            this.supply = this.maxSupply;
                             this.truckState = 'IDLE'; 
                         } else {
                             moveTarget = { x: myBase.x, y: myBase.y };
@@ -475,7 +682,12 @@
                     }
 
                     if (moveTarget) {
-                        let angle = Math.atan2(moveTarget.y - this.y, moveTarget.x - this.x);
+                        let nextTarget = getNextPathWaypoint(this.x, this.y, moveTarget.x, moveTarget.y);
+                        this.targetX = nextTarget.x;
+                        this.targetY = nextTarget.y;
+
+                        let angle = Math.atan2(nextTarget.y - this.y, nextTarget.x - this.x);
+                        this.heading = angle;
                         let moveX = Math.cos(angle) * TRUCK_SPEED;
                         let moveY = Math.sin(angle) * TRUCK_SPEED;
                         
@@ -487,6 +699,7 @@
             draw() {
                 if (this.hp <= 0) return;
 
+                // Range Circles for selected Artillery
                 if (this.type === 'artillery' && selectedUnits.includes(this)) {
                     ctx.save();
                     ctx.strokeStyle = 'rgba(255, 235, 59, 0.4)';
@@ -504,102 +717,168 @@
                     ctx.restore();
                 }
 
+                ctx.save();
+                ctx.translate(this.x, this.y);
+
+                // --- GROUND DROP SHADOW ---
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+                ctx.beginPath();
+                ctx.ellipse(2, 4, this.size/2, this.size/3, 0, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Rotate orientation towards heading
+                ctx.rotate(this.heading);
+
+                // --- HIGH DETAIL UNIT DRAWING ---
                 if (this.type === 'soldier') {
                     let baseColor = this.team === 'player' ? '#2196F3' : '#F44336';
                     let helmetColor = this.team === 'player' ? '#0D47A1' : '#B71C1C';
-                    if (this.supply <= 0) { baseColor = '#555'; helmetColor = '#333'; }
+                    if (this.supply <= 0) { baseColor = '#666'; helmetColor = '#333'; }
 
+                    // Backpack
+                    ctx.fillStyle = '#3E2723';
+                    ctx.fillRect(-9, -4, 4, 8);
+
+                    // Body
                     ctx.fillStyle = baseColor;
                     ctx.beginPath();
-                    ctx.arc(this.x, this.y, this.size/2, 0, Math.PI * 2);
+                    ctx.arc(0, 0, 8, 0, Math.PI * 2);
                     ctx.fill();
-                    
-                    ctx.fillStyle = '#111';
-                    ctx.fillRect(this.x, this.y - 3, 14, 6); 
+                    ctx.strokeStyle = '#111';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
 
+                    // Helmet with visor dot
                     ctx.fillStyle = helmetColor;
                     ctx.beginPath();
-                    ctx.arc(this.x, this.y, this.size/3, 0, Math.PI * 2);
+                    ctx.arc(0, 0, 5, 0, Math.PI * 2);
                     ctx.fill();
+                    ctx.fillStyle = '#00BCD4';
+                    ctx.fillRect(2, -2, 2, 4);
+
+                    // Rifle
+                    ctx.fillStyle = '#111';
+                    ctx.fillRect(2, 1, 10, 3);
+                    ctx.fillStyle = '#795548';
+                    ctx.fillRect(-2, 2, 4, 2);
                 } 
                 else if (this.type === 'medic') {
                     let medicColor = this.team === 'player' ? '#E0F7FA' : '#FFEBEE';
                     if (this.supply <= 0) medicColor = '#777';
 
+                    // Medical Backpack Pouch
+                    ctx.fillStyle = '#FFF';
+                    ctx.fillRect(-9, -5, 4, 10);
+                    ctx.fillStyle = '#E53935';
+                    ctx.fillRect(-8, -2, 2, 4);
+
+                    // Body
                     ctx.fillStyle = medicColor;
                     ctx.beginPath();
-                    ctx.arc(this.x, this.y, this.size/2, 0, Math.PI * 2);
+                    ctx.arc(0, 0, 8, 0, Math.PI * 2);
                     ctx.fill();
+                    ctx.strokeStyle = '#333';
+                    ctx.stroke();
 
-                    ctx.fillStyle = this.team === 'player' ? '#4CAF50' : '#E53935';
-                    ctx.fillRect(this.x - 2, this.y - 6, 4, 12);
-                    ctx.fillRect(this.x - 6, this.y - 2, 12, 4);
+                    // Cross
+                    ctx.fillStyle = this.team === 'player' ? '#2E7D32' : '#C62828';
+                    ctx.fillRect(-2, -5, 4, 10);
+                    ctx.fillRect(-5, -2, 10, 4);
                 }
                 else if (this.type === 'artillery') {
                     let baseColor = this.team === 'player' ? '#1565C0' : '#C62828';
                     if (this.supply <= 0) baseColor = '#444';
 
-                    ctx.fillStyle = baseColor;
-                    ctx.fillRect(this.x - 12, this.y - 10, 24, 20);
+                    // Caterpillar Treads
+                    ctx.fillStyle = '#212121';
+                    ctx.fillRect(-13, -11, 22, 5);
+                    ctx.fillRect(-13, 6, 22, 5);
+                    ctx.fillStyle = '#757575';
+                    for (let tx = -11; tx <= 6; tx += 4) {
+                        ctx.fillRect(tx, -11, 2, 5);
+                        ctx.fillRect(tx, 6, 2, 5);
+                    }
 
-                    ctx.fillStyle = '#555';
+                    // Main Chassis
+                    ctx.fillStyle = baseColor;
+                    ctx.fillRect(-11, -7, 20, 14);
+                    ctx.strokeStyle = '#111';
+                    ctx.strokeRect(-11, -7, 20, 14);
+
+                    // Rotating Turret & Barrel
+                    ctx.fillStyle = '#424242';
+                    ctx.fillRect(0, -3, 16, 6);
+                    ctx.fillStyle = '#212121'; // Muzzle brake
+                    ctx.fillRect(14, -4, 3, 8);
+
+                    ctx.fillStyle = '#333';
                     ctx.beginPath();
-                    ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+                    ctx.arc(0, 0, 7, 0, Math.PI * 2);
                     ctx.fill();
-                    
-                    ctx.fillStyle = '#111';
-                    ctx.fillRect(this.x, this.y - 2, 18, 4);
                 }
                 else if (this.type === 'truck') {
                     let bodyColor = this.team === 'player' ? '#00BCD4' : '#FF9800';
                     let cabColor = this.team === 'player' ? '#006064' : '#E65100';
 
-                    ctx.fillStyle = bodyColor;
-                    ctx.fillRect(this.x - 12, this.y - 8, 18, 16);
-                    
-                    ctx.fillStyle = cabColor;
-                    ctx.fillRect(this.x + 6, this.y - 6, 8, 12); 
+                    // Tires
+                    ctx.fillStyle = '#111';
+                    ctx.fillRect(-10, -11, 6, 4);
+                    ctx.fillRect(-10, 7, 6, 4);
+                    ctx.fillRect(4, -11, 6, 4);
+                    ctx.fillRect(4, 7, 6, 4);
 
-                    ctx.fillStyle = '#000';
-                    ctx.fillRect(this.x - 10, this.y - 11, 6, 4); 
-                    ctx.fillRect(this.x - 10, this.y + 7, 6, 4); 
-                    ctx.fillRect(this.x + 6, this.y - 11, 6, 4); 
-                    ctx.fillRect(this.x + 6, this.y + 7, 6, 4); 
-                    
-                    if (this.truckState === 'DELIVERING') {
-                        ctx.fillStyle = '#FFEB3B';
-                        ctx.fillRect(this.x - 6, this.y - 4, 8, 8);
-                        ctx.strokeStyle = '#000';
-                        ctx.lineWidth = 1;
-                        ctx.strokeRect(this.x - 6, this.y - 4, 8, 8);
-                    }
+                    // Cargo Bed Cover
+                    ctx.fillStyle = bodyColor;
+                    ctx.fillRect(-12, -8, 15, 16);
+                    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+                    ctx.fillRect(-10, -8, 2, 16);
+                    ctx.fillRect(-4, -8, 2, 16);
+
+                    // Cab
+                    ctx.fillStyle = cabColor;
+                    ctx.fillRect(3, -7, 9, 14);
+
+                    // Windshield Reflection
+                    ctx.fillStyle = '#80DEEA';
+                    ctx.fillRect(7, -5, 3, 10);
+
+                    // Headlight Cones
+                    ctx.fillStyle = 'rgba(255, 235, 59, 0.4)';
+                    ctx.beginPath();
+                    ctx.moveTo(12, -5); ctx.lineTo(22, -9); ctx.lineTo(22, -2); ctx.fill();
+                    ctx.beginPath();
+                    ctx.moveTo(12, 5);  ctx.lineTo(22, 2);  ctx.lineTo(22, 9);  ctx.fill();
                 }
 
+                ctx.restore();
+
+                // Low Supply Warning Icon
                 if (this.type !== 'truck' && this.supply <= 0 && Math.floor(Date.now() / 250) % 2 === 0) {
                     ctx.fillStyle = '#FF0000';
                     ctx.font = '14px "Press Start 2P"';
-                    ctx.fillText('!', this.x - 5, this.y - 14);
+                    ctx.fillText('!', this.x - 4, this.y - 16);
                 }
 
+                // Selection Highlight Ring
                 if (selectedUnits.includes(this)) {
                     ctx.strokeStyle = '#FFEB3B';
-                    ctx.lineWidth = 1;
+                    ctx.lineWidth = 1.5;
                     ctx.beginPath();
-                    ctx.arc(this.x, this.y, this.size/2 + 4, 0, Math.PI * 2);
+                    ctx.arc(this.x, this.y, this.size/2 + 5, 0, Math.PI * 2);
                     ctx.stroke();
                 }
 
+                // Health Bar
                 ctx.fillStyle = '#b71c1c';
-                ctx.fillRect(this.x - 12, this.y - 18, 24, 4);
+                ctx.fillRect(this.x - 12, this.y - 20, 24, 4);
                 ctx.fillStyle = '#4CAF50';
-                ctx.fillRect(this.x - 12, this.y - 18, 24 * (this.hp / this.maxHp), 4);
+                ctx.fillRect(this.x - 12, this.y - 20, 24 * (this.hp / this.maxHp), 4);
 
-                if (this.type !== 'truck') {
-                    ctx.fillStyle = '#333';
-                    ctx.fillRect(this.x - 12, this.y - 13, 24, 3);
-                    ctx.fillStyle = '#FFEB3B';
-                    ctx.fillRect(this.x - 12, this.y - 13, 24 * (this.supply / MAX_SUPPLY), 3);
-                }
+                // Supply Bar (Cyan for Trucks, Yellow for Combat/Support units)
+                ctx.fillStyle = '#333';
+                ctx.fillRect(this.x - 12, this.y - 15, 24, 3);
+                ctx.fillStyle = this.type === 'truck' ? '#00BCD4' : '#FFEB3B';
+                ctx.fillRect(this.x - 12, this.y - 15, 24 * (Math.max(0, this.supply) / this.maxSupply), 3);
             }
         }
 
@@ -623,12 +902,10 @@
                 let cpuArtillery = cpuUnits.filter(u => u.type === 'artillery');
                 let cpuMedics = cpuUnits.filter(u => u.type === 'medic');
 
-                // 1. Maintain logistics supply trucks
-                if (cpuCombat.length > 0 && cpuTrucks.length < Math.ceil(cpuCombat.length / 3) && cpuCoins >= 5) {
+                if (cpuCombat.length > 0 && cpuTrucks.length < Math.ceil(cpuCombat.length / 2) && cpuCoins >= 5) {
                     cpuCoins -= 5;
                     units.push(new Unit('cpu', 'truck', cBase.x + (Math.random()*40-20), cBase.y + (Math.random()*40-20)));
                 } 
-                // 2. Strategic Choke Point Artillery
                 else if (cpuArtillery.length < CHOKE_POINTS.length && cpuCoins >= 25) {
                     cpuCoins -= 25;
                     let targetChoke = CHOKE_POINTS[cpuArtillery.length];
@@ -638,7 +915,6 @@
                     art.targetY = targetChoke.artPos.y + (Math.random()*30 - 15);
                     units.push(art);
                 }
-                // 3. Strategic Choke Point Medics (Deploy to support choke defenders)
                 else if (cpuMedics.length < 2 && cpuCoins >= 15) {
                     cpuCoins -= 15;
                     let targetChoke = CHOKE_POINTS[cpuMedics.length % CHOKE_POINTS.length];
@@ -648,7 +924,6 @@
                     medic.targetY = targetChoke.artPos.y;
                     units.push(medic);
                 }
-                // 4. Infantry Waves / Choke Blockades
                 else if (cpuCoins >= 10) {
                     cpuCoins -= 10;
                     let soldier = new Unit('cpu', 'soldier', cBase.x + (Math.random()*20-10), cBase.y + (Math.random()*20-10));
@@ -748,7 +1023,6 @@
             ctx.fillStyle = '#384d26';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Subtle tactical grass grid overlay
             ctx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
             ctx.lineWidth = 1;
             for(let i=0; i<1000; i+=40) {
@@ -761,18 +1035,16 @@
             // 2. Enhanced Terrain Graphics
             terrainFeatures.forEach(t => {
                 if (t.type === 'river') {
-                    // River bed & Animated water currents
                     ctx.fillStyle = '#185a9d'; 
                     ctx.fillRect(t.x, t.y, t.w, t.h);
 
                     ctx.fillStyle = '#1e88e5'; 
                     ctx.fillRect(t.x + 8, t.y, t.w - 16, t.h);
 
-                    // Flowing wave ripples
+                    // Static river waves
                     ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
                     ctx.lineWidth = 2;
-                    let waveOffset = (animFrame * 0.8) % 40;
-                    for (let wy = t.y + waveOffset; wy < t.y + t.h; wy += 40) {
+                    for (let wy = t.y + 20; wy < t.y + t.h; wy += 40) {
                         ctx.beginPath();
                         ctx.moveTo(t.x + 15, wy);
                         ctx.quadraticCurveTo(t.x + 50, wy - 10, t.x + 85, wy);
@@ -780,11 +1052,9 @@
                     }
                 } 
                 else if (t.type === 'mountain') {
-                    // Mountain Base
                     ctx.fillStyle = '#3e2723'; 
                     ctx.fillRect(t.x, t.y, t.w, t.h);
 
-                    // Geometric mountain peaks & shading
                     ctx.fillStyle = '#5d4037';
                     for (let my = t.y; my < t.y + t.h; my += 60) {
                         ctx.beginPath();
@@ -793,7 +1063,6 @@
                         ctx.lineTo(t.x + t.w, my + 60);
                         ctx.fill();
 
-                        // Shading ridge line
                         ctx.fillStyle = '#2c1d1a';
                         ctx.beginPath();
                         ctx.moveTo(t.x + t.w/2, my);
