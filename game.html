@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logistics Wars v0.016</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+        body {
+            background-color: #111;
+            color: #eee;
+            font-family: 'Press Start 2P', monospace;
+            text-align: center;
+            margin: 0;
+            padding: 20px;
+            user-select: none;
+        }
+
+        h1 {
+            font-size: 24px;
+            color: #4CAF50;
+            margin-bottom: 10px;
+        }
+
+        #game-container {
+            position: relative;
+            display: inline-block;
+        }
+
+        canvas {
+            background-color: #2b3a1a;
+            border: 4px solid #555;
+            image-rendering: pixelated;
+            cursor: crosshair;
+        }
+
+        .ui-panel {
+            margin-top: 15px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .stats {
+            font-size: 14px;
+            background: #000;
+            padding: 10px;
+            border: 2px solid #555;
+        }
+
+        .coin-text {
+            color: #FFD700;
+        }
+
+        button {
+            font-family: 'Press Start 2P', monospace;
+            background: #000;
+            color: #fff;
+            border: 2px solid #fff;
+            padding: 12px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        button:hover { background: #333; }
+        button:active { background: #666; }
+        
+        .instructions {
+            margin-top: 15px;
+            font-size: 10px;
+            color: #aaa;
+            line-height: 1.6;
+        }
+
+        #game-over {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.9);
+            border: 4px solid #fff;
+            padding: 30px;
+            display: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>LOGISTICS WARS v0.016</h1>
+    
+    <div id="game-container">
+        <canvas id="gameCanvas" width="1000" height="700" oncontextmenu="return false;"></canvas>
+        <div id="game-over">
+            <h2 id="win-msg">YOU WIN!</h2>
+            <button onclick="location.reload()">PLAY AGAIN</button>
+        </div>
+    </div>
+
+    <div class="ui-panel">
+        <div class="stats">
+            COINS: <span id="coin-display" class="coin-text">0</span>
+        </div>
+        <button onclick="buyUnit('soldier')">BUY SOLDIER (10)</button>
+        <button onclick="buyUnit('medic')">BUY MEDIC (15)</button>
+        <button onclick="buyUnit('artillery')">BUY ARTILLERY (25)</button>
+        <button onclick="buyUnit('truck')">BUY TRUCK (5)</button>
+    </div>
+
+    <div class="instructions">
+        LEFT CLICK / DRAG to select units (Soldiers, Medics, Artillery). RIGHT CLICK to move.<br>
+        Units smoothly slide around terrain obstacles.<br>
+        Passive supply drain is increased—keep Trucks active to maintain your frontline!<br>
+        Watch out: Computer AI locks down key mountain & river choke points with Artillery!
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const coinDisplay = document.getElementById('coin-display');
+        const gameOverDiv = document.getElementById('game-over');
+        const winMsg = document.getElementById('win-msg');
+
+        // Game State
+        let coins = 30;
+        let cpuCoins = 30;
+        let units = [];
+        let bases = [];
+        let explosions = []; 
+        let isGameOver = false;
+        let animFrame = 0;
+
+        // Selection variables
+        let isSelecting = false;
+        let selectionBox = { x: 0, y: 0, w: 0, h: 0 };
+        let selectedUnits = [];
+
+        // Constants
+        const BASE_HP = 1000;
+        const SOLDIER_HP = 50;
+        const ARTILLERY_HP = 15; 
+        const MEDIC_HP = 30;
+        const SOLDIER_SPEED = 1.2;
+        const ARTILLERY_SPEED = 0.6;
+        const MEDIC_SPEED = 1.4;
+        const TRUCK_SPEED = 2.0;
+        const MAX_SUPPLY = 100;
+        
+        // Range Configuration
+        const SOLDIER_FIRING_RANGE = 160; 
+        const ARTILLERY_MAX_RANGE = 350;
+        const ARTILLERY_MIN_RANGE = 150; 
+        const MEDIC_HEAL_RANGE = 120;
+        
+        const COLLISION_RADIUS = 20; 
+
+        // Strategic Choke Points
+        const CHOKE_POINTS = [
+            { name: 'North River Gap', x: 550, y: 120, artPos: { x: 720, y: 120 }, defPos: { x: 620, y: 120 } },
+            { name: 'South Mountain Gap', x: 250, y: 580, artPos: { x: 400, y: 580 }, defPos: { x: 320, y: 580 } }
+        ];
+
+        // Snaking Terrain Configuration
+        const terrainFeatures = [
+            { type: 'mountain', x: 250, y: 0, w: 100, h: 450 },  
+            { type: 'river',    x: 550, y: 250, w: 100, h: 450 } 
+        ];
+
+        function checkTerrainCollision(x, y, radius) {
+            for (let t of terrainFeatures) {
+                let testX = x;
+                let testY = y;
+                
+                if (x < t.x) testX = t.x;      
+                else if (x > t.x + t.w) testX = t.x + t.w;   
+                
+                if (y < t.y) testY = t.y;      
+                else if (y > t.y + t.h) testY = t.y + t.h;   
+                
+                let distX = x - testX;
+                let distY = y - testY;
+                let distance = Math.sqrt((distX*distX) + (distY*distY));
+                
+                if (distance <= radius) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Smooth Navigation & Wall Sliding
+        function attemptSmoothMove(unit, moveX, moveY) {
+            let nextX = unit.x + moveX;
+            let nextY = unit.y + moveY;
+            let radius = unit.size / 2;
+
+            // Direct move check
+            if (!checkTerrainCollision(nextX, nextY, radius)) {
+                unit.x = nextX;
+                unit.y = nextY;
+                return true;
+            }
+
+            // Slide along X axis
+            if (!checkTerrainCollision(nextX, unit.y, radius)) {
+                unit.x = nextX;
+                return true;
+            }
+
+            // Slide along Y axis
+            if (!checkTerrainCollision(unit.x, nextY, radius)) {
+                unit.y = nextY;
+                return true;
+            }
+
+            // Probe arc angles to smoothly navigate sharp corners
+            let currentAngle = Math.atan2(moveY, moveX);
+            let speed = Math.hypot(moveX, moveY);
+
+            for (let angleOffset = 0.3; angleOffset <= 1.2; angleOffset += 0.3) {
+                for (let dir of [-1, 1]) {
+                    let probeAngle = currentAngle + (angleOffset * dir);
+                    let probeX = unit.x + Math.cos(probeAngle) * speed;
+                    let probeY = unit.y + Math.sin(probeAngle) * speed;
+
+                    if (!checkTerrainCollision(probeX, probeY, radius)) {
+                        unit.x = probeX;
+                        unit.y = probeY;
+                        return true;
+                    }
+                }
+            }
+
+            return false; // Completely blocked
+        }
+
+        class Base {
+            constructor(team, x, y) {
+                this.team = team;
+                this.x = x;
+                this.y = y;
+                this.size = 70;
+                this.hp = BASE_HP;
+                this.maxHp = BASE_HP;
+            }
+            draw() {
+                ctx.fillStyle = this.team === 'player' ? '#2196F3' : '#F44336';
+                ctx.fillRect(this.x - this.size/2, this.y - this.size/2, this.size, this.size);
+                
+                ctx.fillStyle = 'rgba(0,0,0,0.3)';
+                ctx.fillRect(this.x - 20, this.y - 20, 40, 40);
+                
+                ctx.fillStyle = '#b71c1c';
+                ctx.fillRect(this.x - this.size/2, this.y - this.size/2 - 20, this.size, 6);
+                ctx.fillStyle = '#4CAF50';
+                ctx.fillRect(this.x - this.size/2, this.y - this.size/2 - 20, this.size * (this.hp / this.maxHp), 6);
+            }
+        }
+
+        class Unit {
+            constructor(team, type, x, y) {
+                this.team = team;
+                this.type = type;
+                this.x = x;
+                this.y = y;
+                this.targetX = null;
+                this.targetY = null;
+                this.waypoints = []; 
+                
+                this.hp = type === 'soldier' ? SOLDIER_HP : (type === 'artillery' ? ARTILLERY_HP : (type === 'medic' ? MEDIC_HP : 20));
+                this.maxHp = this.hp;
+                this.size = type === 'soldier' ? 18 : (type === 'artillery' ? 24 : (type === 'medic' ? 18 : 22)); 
+                this.role = 'attacker'; 
+                
+                this.supply = MAX_SUPPLY;
+                this.attackCooldown = 0;
+                
+                this.truckState = 'IDLE'; 
+                this.truckTarget = null;
+            }
+
+            update() {
+                if (this.hp <= 0) return;
+
+                // --- INCREASED PASSIVE SUPPLY DRAIN (Idle / Moving) ---
+                if (this.type !== 'truck') {
+                    this.supply -= 0.015; // Increased from 0.005
+                    if (this.supply < 0) this.supply = 0;
+                }
+
+                // CPU Waypoint Navigation
+                if (this.team === 'cpu' && this.waypoints.length > 0 && this.type !== 'truck') {
+                    this.targetX = this.waypoints[0].x;
+                    this.targetY = this.waypoints[0].y;
+                    if (Math.hypot(this.targetX - this.x, this.targetY - this.y) < 40) {
+                        this.waypoints.shift(); 
+                    }
+                }
+
+                // Movement Logic for Combat / Support Units
+                if (this.type !== 'truck' && this.targetX !== null && this.targetY !== null) {
+                    let dist = Math.hypot(this.targetX - this.x, this.targetY - this.y);
+                    if (dist > 2) {
+                        let speed = this.type === 'artillery' ? ARTILLERY_SPEED : (this.type === 'medic' ? MEDIC_SPEED : SOLDIER_SPEED);
+                        let angle = Math.atan2(this.targetY - this.y, this.targetX - this.x);
+                        let moveX = Math.cos(angle) * speed;
+                        let moveY = Math.sin(angle) * speed;
+                        
+                        let moved = attemptSmoothMove(this, moveX, moveY);
+                        
+                        if (!moved && this.team === 'player') {
+                            this.targetX = null;
+                            this.targetY = null;
+                        }
+                    } else {
+                        if (this.team === 'player') {
+                            this.targetX = null;
+                            this.targetY = null;
+                        }
+                    }
+                }
+
+                // --- MEDIC HEALING LOGIC ---
+                if (this.type === 'medic' && this.supply > 0) {
+                    let healTarget = null;
+                    let lowestHpRatio = 1.0;
+
+                    units.forEach(u => {
+                        if (u.team === this.team && u.type === 'soldier' && u.hp < u.maxHp && u.hp > 0) {
+                            let d = Math.hypot(u.x - this.x, u.y - this.y);
+                            if (d <= MEDIC_HEAL_RANGE) {
+                                let ratio = u.hp / u.maxHp;
+                                if (ratio < lowestHpRatio) {
+                                    lowestHpRatio = ratio;
+                                    healTarget = u;
+                                }
+                            }
+                        }
+                    });
+
+                    if (healTarget) {
+                        healTarget.hp = Math.min(healTarget.maxHp, healTarget.hp + 0.35); 
+                        this.supply -= 0.18; 
+
+                        // Draw healing ray
+                        ctx.beginPath();
+                        ctx.moveTo(this.x, this.y);
+                        ctx.lineTo(healTarget.x, healTarget.y);
+                        ctx.strokeStyle = '#4CAF50';
+                        ctx.lineWidth = 2;
+                        ctx.stroke();
+                        ctx.lineWidth = 1;
+                    }
+                }
+
+                // --- COMBAT UNITS (Soldier & Artillery) LOGIC ---
+                if (this.type === 'soldier' || this.type === 'artillery') {
+                    if (this.attackCooldown > 0) this.attackCooldown--;
+                    else {
+                        let enemyBase = bases.find(b => b.team !== this.team);
+                        let target = null;
+                        let minDist = 1000;
+                        
+                        let maxRange = this.type === 'artillery' ? ARTILLERY_MAX_RANGE : SOLDIER_FIRING_RANGE;
+                        let minRange = this.type === 'artillery' ? ARTILLERY_MIN_RANGE : 0;
+
+                        // Check base
+                        let distToBase = Math.hypot(enemyBase.x - this.x, enemyBase.y - this.y);
+                        if (distToBase < maxRange + enemyBase.size/2 && distToBase >= minRange) {
+                            target = enemyBase;
+                            minDist = distToBase;
+                        }
+
+                        // Check enemy units
+                        units.forEach(u => {
+                            if (u.team !== this.team && u.hp > 0) {
+                                let d = Math.hypot(u.x - this.x, u.y - this.y);
+                                if (d <= maxRange && d >= minRange && d < minDist) {
+                                    target = u;
+                                    minDist = d;
+                                }
+                            }
+                        });
+
+                        // Fire
+                        if (target) {
+                            if (this.type === 'artillery') {
+                                let baseDmg = this.supply > 0 ? 15 : 2; 
+                                this.supply -= 6.0; 
+                                if (this.supply < 0) this.supply = 0;
+                                
+                                units.forEach(u => {
+                                    if (u.team !== this.team && u.hp > 0) {
+                                        if (Math.hypot(u.x - target.x, u.y - target.y) < 60) u.hp -= baseDmg;
+                                    }
+                                });
+                                if (Math.hypot(enemyBase.x - target.x, enemyBase.y - target.y) < 60 + enemyBase.size/2) {
+                                     enemyBase.hp -= baseDmg;
+                                }
+
+                                this.attackCooldown = 150; 
+                                explosions.push({ x: target.x, y: target.y, life: 30, maxLife: 30, radius: 60 });
+                                
+                                let midX = (this.x + target.x) / 2;
+                                let midY = (this.y + target.y) / 2 - 50; 
+                                ctx.beginPath();
+                                ctx.moveTo(this.x, this.y);
+                                ctx.quadraticCurveTo(midX, midY, target.x, target.y);
+                                ctx.strokeStyle = '#FF5722';
+                                ctx.lineWidth = 2;
+                                ctx.stroke();
+                                ctx.lineWidth = 1;
+
+                            } else {
+                                let dmg = this.supply > 0 ? 5 : 1; 
+                                this.supply -= 0.5; 
+                                if (this.supply < 0) this.supply = 0;
+
+                                let defMultiplier = target.supply > 0 ? 0.5 : 1.0; 
+                                if (target instanceof Base) defMultiplier = 1.0; 
+                                
+                                target.hp -= dmg * defMultiplier;
+                                this.attackCooldown = 60; 
+                                
+                                ctx.beginPath();
+                                ctx.moveTo(this.x, this.y);
+                                ctx.lineTo(target.x, target.y);
+                                ctx.strokeStyle = '#fff';
+                                ctx.stroke();
+                            }
+                        }
+                    }
+                }
+
+                // --- TRUCK LOGIC ---
+                if (this.type === 'truck') {
+                    let moveTarget = null;
+
+                    if (this.truckState === 'IDLE') {
+                        let needyUnits = units.filter(u => u.team === this.team && u.type !== 'truck' && u.supply < 60 && u.hp > 0);
+                        
+                        if (needyUnits.length > 0) {
+                            needyUnits.sort((a, b) => a.supply - b.supply);
+                            this.truckTarget = needyUnits[0];
+                            this.truckState = 'DELIVERING';
+                        }
+                    } 
+                    else if (this.truckState === 'DELIVERING') {
+                        if (this.truckTarget && this.truckTarget.hp > 0) {
+                            let dist = Math.hypot(this.truckTarget.x - this.x, this.truckTarget.y - this.y);
+                            if (dist < 25) {
+                                this.truckTarget.supply = MAX_SUPPLY;
+                                this.truckTarget = null;
+                                this.truckState = 'RETURNING';
+                            } else {
+                                moveTarget = { x: this.truckTarget.x, y: this.truckTarget.y };
+                            }
+                        } else {
+                            this.truckTarget = null;
+                            this.truckState = 'RETURNING';
+                        }
+                    } 
+                    else if (this.truckState === 'RETURNING') {
+                        let myBase = bases.find(b => b.team === this.team);
+                        let dist = Math.hypot(myBase.x - this.x, myBase.y - this.y);
+                        if (dist < myBase.size/2 + 15) {
+                            this.truckState = 'IDLE'; 
+                        } else {
+                            moveTarget = { x: myBase.x, y: myBase.y };
+                        }
+                    }
+
+                    if (moveTarget) {
+                        let angle = Math.atan2(moveTarget.y - this.y, moveTarget.x - this.x);
+                        let moveX = Math.cos(angle) * TRUCK_SPEED;
+                        let moveY = Math.sin(angle) * TRUCK_SPEED;
+                        
+                        attemptSmoothMove(this, moveX, moveY);
+                    }
+                }
+            }
+
+            draw() {
+                if (this.hp <= 0) return;
+
+                if (this.type === 'artillery' && selectedUnits.includes(this)) {
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(255, 235, 59, 0.4)';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, ARTILLERY_MAX_RANGE, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    ctx.strokeStyle = 'rgba(244, 67, 54, 0.5)';
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([4, 4]);
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, ARTILLERY_MIN_RANGE, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                if (this.type === 'soldier') {
+                    let baseColor = this.team === 'player' ? '#2196F3' : '#F44336';
+                    let helmetColor = this.team === 'player' ? '#0D47A1' : '#B71C1C';
+                    if (this.supply <= 0) { baseColor = '#555'; helmetColor = '#333'; }
+
+                    ctx.fillStyle = baseColor;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size/2, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    ctx.fillStyle = '#111';
+                    ctx.fillRect(this.x, this.y - 3, 14, 6); 
+
+                    ctx.fillStyle = helmetColor;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size/3, 0, Math.PI * 2);
+                    ctx.fill();
+                } 
+                else if (this.type === 'medic') {
+                    let medicColor = this.team === 'player' ? '#E0F7FA' : '#FFEBEE';
+                    if (this.supply <= 0) medicColor = '#777';
+
+                    ctx.fillStyle = medicColor;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size/2, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.fillStyle = this.team === 'player' ? '#4CAF50' : '#E53935';
+                    ctx.fillRect(this.x - 2, this.y - 6, 4, 12);
+                    ctx.fillRect(this.x - 6, this.y - 2, 12, 4);
+                }
+                else if (this.type === 'artillery') {
+                    let baseColor = this.team === 'player' ? '#1565C0' : '#C62828';
+                    if (this.supply <= 0) baseColor = '#444';
+
+                    ctx.fillStyle = baseColor;
+                    ctx.fillRect(this.x - 12, this.y - 10, 24, 20);
+
+                    ctx.fillStyle = '#555';
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    ctx.fillStyle = '#111';
+                    ctx.fillRect(this.x, this.y - 2, 18, 4);
+                }
+                else if (this.type === 'truck') {
+                    let bodyColor = this.team === 'player' ? '#00BCD4' : '#FF9800';
+                    let cabColor = this.team === 'player' ? '#006064' : '#E65100';
+
+                    ctx.fillStyle = bodyColor;
+                    ctx.fillRect(this.x - 12, this.y - 8, 18, 16);
+                    
+                    ctx.fillStyle = cabColor;
+                    ctx.fillRect(this.x + 6, this.y - 6, 8, 12); 
+
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(this.x - 10, this.y - 11, 6, 4); 
+                    ctx.fillRect(this.x - 10, this.y + 7, 6, 4); 
+                    ctx.fillRect(this.x + 6, this.y - 11, 6, 4); 
+                    ctx.fillRect(this.x + 6, this.y + 7, 6, 4); 
+                    
+                    if (this.truckState === 'DELIVERING') {
+                        ctx.fillStyle = '#FFEB3B';
+                        ctx.fillRect(this.x - 6, this.y - 4, 8, 8);
+                        ctx.strokeStyle = '#000';
+                        ctx.lineWidth = 1;
+                        ctx.strokeRect(this.x - 6, this.y - 4, 8, 8);
+                    }
+                }
+
+                if (this.type !== 'truck' && this.supply <= 0 && Math.floor(Date.now() / 250) % 2 === 0) {
+                    ctx.fillStyle = '#FF0000';
+                    ctx.font = '14px "Press Start 2P"';
+                    ctx.fillText('!', this.x - 5, this.y - 14);
+                }
+
+                if (selectedUnits.includes(this)) {
+                    ctx.strokeStyle = '#FFEB3B';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size/2 + 4, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+
+                ctx.fillStyle = '#b71c1c';
+                ctx.fillRect(this.x - 12, this.y - 18, 24, 4);
+                ctx.fillStyle = '#4CAF50';
+                ctx.fillRect(this.x - 12, this.y - 18, 24 * (this.hp / this.maxHp), 4);
+
+                if (this.type !== 'truck') {
+                    ctx.fillStyle = '#333';
+                    ctx.fillRect(this.x - 12, this.y - 13, 24, 3);
+                    ctx.fillStyle = '#FFEB3B';
+                    ctx.fillRect(this.x - 12, this.y - 13, 24 * (this.supply / MAX_SUPPLY), 3);
+                }
+            }
+        }
+
+        // Base Setup
+        bases.push(new Base('player', 100, 350));
+        bases.push(new Base('cpu', 900, 350));
+
+        // Strategic CPU AI & Economy Loop
+        setInterval(() => {
+            if (isGameOver) return;
+            coins += 1;
+            cpuCoins += 1;
+            coinDisplay.innerText = coins;
+            
+            if (cpuCoins >= 5) {
+                let pBase = bases.find(b => b.team === 'player');
+                let cBase = bases.find(b => b.team === 'cpu');
+                let cpuUnits = units.filter(u => u.team === 'cpu' && u.hp > 0);
+                let cpuCombat = cpuUnits.filter(u => u.type === 'soldier' || u.type === 'artillery' || u.type === 'medic');
+                let cpuTrucks = cpuUnits.filter(u => u.type === 'truck');
+                let cpuArtillery = cpuUnits.filter(u => u.type === 'artillery');
+                let cpuMedics = cpuUnits.filter(u => u.type === 'medic');
+
+                // 1. Maintain logistics supply trucks
+                if (cpuCombat.length > 0 && cpuTrucks.length < Math.ceil(cpuCombat.length / 3) && cpuCoins >= 5) {
+                    cpuCoins -= 5;
+                    units.push(new Unit('cpu', 'truck', cBase.x + (Math.random()*40-20), cBase.y + (Math.random()*40-20)));
+                } 
+                // 2. Strategic Choke Point Artillery
+                else if (cpuArtillery.length < CHOKE_POINTS.length && cpuCoins >= 25) {
+                    cpuCoins -= 25;
+                    let targetChoke = CHOKE_POINTS[cpuArtillery.length];
+                    let art = new Unit('cpu', 'artillery', cBase.x + (Math.random()*20-10), cBase.y + (Math.random()*20-10));
+                    art.role = 'choke_guard';
+                    art.targetX = targetChoke.artPos.x + (Math.random()*30 - 15);
+                    art.targetY = targetChoke.artPos.y + (Math.random()*30 - 15);
+                    units.push(art);
+                }
+                // 3. Strategic Choke Point Medics (Deploy to support choke defenders)
+                else if (cpuMedics.length < 2 && cpuCoins >= 15) {
+                    cpuCoins -= 15;
+                    let targetChoke = CHOKE_POINTS[cpuMedics.length % CHOKE_POINTS.length];
+                    let medic = new Unit('cpu', 'medic', cBase.x + (Math.random()*20-10), cBase.y + (Math.random()*20-10));
+                    medic.role = 'choke_medic';
+                    medic.targetX = targetChoke.artPos.x - 30;
+                    medic.targetY = targetChoke.artPos.y;
+                    units.push(medic);
+                }
+                // 4. Infantry Waves / Choke Blockades
+                else if (cpuCoins >= 10) {
+                    cpuCoins -= 10;
+                    let soldier = new Unit('cpu', 'soldier', cBase.x + (Math.random()*20-10), cBase.y + (Math.random()*20-10));
+                    let chokeDefenders = cpuCombat.filter(s => s.role === 'choke_defender');
+
+                    if (chokeDefenders.length < 6) {
+                        let chokeIdx = chokeDefenders.length % CHOKE_POINTS.length;
+                        soldier.role = 'choke_defender';
+                        soldier.targetX = CHOKE_POINTS[chokeIdx].defPos.x + (Math.random()*30 - 15);
+                        soldier.targetY = CHOKE_POINTS[chokeIdx].defPos.y + (Math.random()*30 - 15);
+                    } else {
+                        soldier.role = 'attacker';
+                        soldier.waypoints = [
+                            { x: CHOKE_POINTS[0].x, y: CHOKE_POINTS[0].y },
+                            { x: CHOKE_POINTS[1].x, y: CHOKE_POINTS[1].y },
+                            { x: pBase.x, y: pBase.y }
+                        ];
+                    }
+                    units.push(soldier);
+                }
+            }
+        }, 1000);
+
+        // Buy Units via UI
+        window.buyUnit = function(type) {
+            let cost = type === 'artillery' ? 25 : (type === 'medic' ? 15 : (type === 'soldier' ? 10 : 5));
+            if (coins >= cost) {
+                coins -= cost;
+                coinDisplay.innerText = coins;
+                let b = bases.find(b => b.team === 'player');
+                units.push(new Unit('player', type, b.x + (Math.random()*40-20), b.y + (Math.random()*40-20)));
+            }
+        }
+
+        // Selection & Right-Click Commands
+        canvas.addEventListener('mousedown', (e) => {
+            if (isGameOver) return;
+            let rect = canvas.getBoundingClientRect();
+            let mouseX = e.clientX - rect.left;
+            let mouseY = e.clientY - rect.top;
+
+            if (e.button === 0) { 
+                isSelecting = true;
+                selectionBox.x = mouseX;
+                selectionBox.y = mouseY;
+                selectionBox.w = 0;
+                selectionBox.h = 0;
+            } else if (e.button === 2) { 
+                selectedUnits.forEach(u => {
+                    if (u.type === 'soldier' || u.type === 'artillery' || u.type === 'medic') { 
+                        u.targetX = mouseX + (Math.random()*30 - 15);
+                        u.targetY = mouseY + (Math.random()*30 - 15);
+                    }
+                });
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (isSelecting) {
+                let rect = canvas.getBoundingClientRect();
+                selectionBox.w = (e.clientX - rect.left) - selectionBox.x;
+                selectionBox.h = (e.clientY - rect.top) - selectionBox.y;
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 0 && isSelecting) { 
+                isSelecting = false;
+                selectedUnits = [];
+                
+                let x1 = Math.min(selectionBox.x, selectionBox.x + selectionBox.w);
+                let x2 = Math.max(selectionBox.x, selectionBox.x + selectionBox.w);
+                let y1 = Math.min(selectionBox.y, selectionBox.y + selectionBox.h);
+                let y2 = Math.max(selectionBox.y, selectionBox.y + selectionBox.h);
+
+                units.forEach(u => {
+                    if (u.team === 'player' && u.hp > 0 && u.type !== 'truck') {
+                        if (Math.abs(selectionBox.w) < 5 && Math.abs(selectionBox.h) < 5) {
+                            if (Math.hypot(u.x - x1, u.y - y1) < u.size) selectedUnits.push(u);
+                        } 
+                        else if (u.x >= x1 && u.x <= x2 && u.y >= y1 && u.y <= y2) {
+                            selectedUnits.push(u);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Main Rendering Loop
+        function loop() {
+            if (isGameOver) return;
+            animFrame++;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. Render Battlefield Grass Background
+            ctx.fillStyle = '#384d26';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Subtle tactical grass grid overlay
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
+            ctx.lineWidth = 1;
+            for(let i=0; i<1000; i+=40) {
+                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 700); ctx.stroke();
+            }
+            for(let i=0; i<700; i+=40) {
+                ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(1000, i); ctx.stroke();
+            }
+
+            // 2. Enhanced Terrain Graphics
+            terrainFeatures.forEach(t => {
+                if (t.type === 'river') {
+                    // River bed & Animated water currents
+                    ctx.fillStyle = '#185a9d'; 
+                    ctx.fillRect(t.x, t.y, t.w, t.h);
+
+                    ctx.fillStyle = '#1e88e5'; 
+                    ctx.fillRect(t.x + 8, t.y, t.w - 16, t.h);
+
+                    // Flowing wave ripples
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+                    ctx.lineWidth = 2;
+                    let waveOffset = (animFrame * 0.8) % 40;
+                    for (let wy = t.y + waveOffset; wy < t.y + t.h; wy += 40) {
+                        ctx.beginPath();
+                        ctx.moveTo(t.x + 15, wy);
+                        ctx.quadraticCurveTo(t.x + 50, wy - 10, t.x + 85, wy);
+                        ctx.stroke();
+                    }
+                } 
+                else if (t.type === 'mountain') {
+                    // Mountain Base
+                    ctx.fillStyle = '#3e2723'; 
+                    ctx.fillRect(t.x, t.y, t.w, t.h);
+
+                    // Geometric mountain peaks & shading
+                    ctx.fillStyle = '#5d4037';
+                    for (let my = t.y; my < t.y + t.h; my += 60) {
+                        ctx.beginPath();
+                        ctx.moveTo(t.x, my + 60);
+                        ctx.lineTo(t.x + t.w/2, my);
+                        ctx.lineTo(t.x + t.w, my + 60);
+                        ctx.fill();
+
+                        // Shading ridge line
+                        ctx.fillStyle = '#2c1d1a';
+                        ctx.beginPath();
+                        ctx.moveTo(t.x + t.w/2, my);
+                        ctx.lineTo(t.x + t.w, my + 60);
+                        ctx.lineTo(t.x + t.w/2, my + 60);
+                        ctx.fill();
+                        ctx.fillStyle = '#5d4037';
+                    }
+                }
+            });
+
+            // Update & Draw Bases
+            bases.forEach(b => b.draw());
+
+            // Check Win / Loss
+            let pBase = bases.find(b => b.team === 'player');
+            let cBase = bases.find(b => b.team === 'cpu');
+            if (pBase.hp <= 0) endGame("CPU WINS! BASE DESTROYED.", '#F44336');
+            else if (cBase.hp <= 0) endGame("YOU WIN! ENEMY BASE DESTROYED.", '#4CAF50');
+
+            // Update & Draw Units
+            units = units.filter(u => u.hp > 0); 
+            units.forEach(u => {
+                u.update();
+                u.draw();
+            });
+
+            // Draw Explosions
+            for (let i = explosions.length - 1; i >= 0; i--) {
+                let exp = explosions[i];
+                ctx.fillStyle = `rgba(255, 152, 0, ${exp.life / exp.maxLife})`;
+                ctx.beginPath();
+                ctx.arc(exp.x, exp.y, exp.radius * (1 - exp.life/exp.maxLife), 0, Math.PI * 2);
+                ctx.fill();
+                
+                exp.life--;
+                if (exp.life <= 0) explosions.splice(i, 1);
+            }
+
+            // Draw Selection Box
+            if (isSelecting) {
+                ctx.strokeStyle = '#00FF00';
+                ctx.setLineDash([5, 5]);
+                ctx.strokeRect(selectionBox.x, selectionBox.y, selectionBox.w, selectionBox.h);
+                ctx.setLineDash([]);
+            }
+
+            requestAnimationFrame(loop);
+        }
+
+        function endGame(msg, color) {
+            isGameOver = true;
+            gameOverDiv.style.display = 'block';
+            winMsg.innerText = msg;
+            winMsg.style.color = color;
+        }
+
+        // Start game
+        loop();
+    </script>
+</body>
+</html>
